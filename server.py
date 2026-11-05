@@ -11,7 +11,15 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import serialization
 import hashlib
 
+# Thử import findmy để truy vấn Apple Find My Network thực tế nếu đã đăng nhập Apple ID
+try:
+    from findmy import AppleAccount, KeyPair
+    FINDMY_AVAILABLE = True
+except ImportError:
+    FINDMY_AVAILABLE = False
+
 PORT = int(os.environ.get("PORT", 6176))
+ACCOUNT_FILE = os.path.join(os.path.dirname(__file__), "account.json")
 
 # Thông tin cặp khóa Find My của SUSI Keychain
 SUSI_KEYS = {
@@ -23,51 +31,96 @@ SUSI_KEYS = {
     "hashed_adv_key_b64": "nUI+ZdOio/9bVttGZdfuCC+Y2TtL3E06QpIO4yuQvLA="
 }
 
-# Tọa độ mặc định của SUSI (TP. Hồ Chí Minh)
-DEFAULT_LAT = 10.7769
-DEFAULT_LON = 106.7009
+# Tọa độ mặc định lưu tạm thời (sẽ tự động cập nhật khi có iPhone bắt sóng)
+latest_location = {
+    "lat": 10.7769,
+    "lon": 106.7009,
+    "timestamp": int(time.time()),
+    "source": "Initial Setup"
+}
 
-def generate_encrypted_findmy_report(report_id, lat=DEFAULT_LAT, lon=DEFAULT_LON):
+apple_account = None
+
+def init_apple_account():
+    global apple_account
+    if FINDMY_AVAILABLE and os.path.exists(ACCOUNT_FILE):
+        try:
+            apple_account = AppleAccount.from_json(ACCOUNT_FILE)
+            print("Apple ID session loaded successfully!")
+        except Exception as e:
+            print(f"Error loading Apple ID account: {e}")
+
+init_apple_account()
+
+def query_real_apple_findmy():
+    """
+    Truy vấn trực tiếp máy chủ Apple Find My Gateway để lấy tọa độ thực tế do iPhone xung quanh gửi về
+    """
+    global apple_account, latest_location
+    if not apple_account:
+        return None
+
+    try:
+        key = KeyPair.from_b64(SUSI_KEYS["priv_key_b64"])
+        report = apple_account.fetch_location(key)
+        if report:
+            latest_location["lat"] = report.latitude
+            latest_location["lon"] = report.longitude
+            latest_location["timestamp"] = int(report.timestamp.timestamp())
+            latest_location["source"] = "Apple Find My Network (iPhone Crowdsourced)"
+            print(f"[Apple Find My Report] Lat: {report.latitude}, Lon: {report.longitude}, Time: {report.timestamp}")
+            
+            # Lưu lại phiên đăng nhập để tránh bị out
+            apple_account.to_json(ACCOUNT_FILE)
+            
+            return {
+                "id": SUSI_KEYS["hashed_adv_key_b64"],
+                "payload": base64.b64encode(report.payload).decode("utf-8") if isinstance(report.payload, bytes) else report.payload,
+                "datePublished": int(report.timestamp.timestamp() * 1000),
+                "statusCode": 0
+            }
+    except Exception as e:
+        print(f"Error querying Apple Find My: {e}")
+    return None
+
+def generate_encrypted_findmy_report(report_id, lat=None, lon=None):
     """
     Tạo Apple Find My encrypted payload chuẩn xác (88 bytes)
-    Khớp hoàn toàn với cơ chế giải mã DecryptReports của Macless-Haystack / OpenHaystack App.
     """
+    if lat is None:
+        lat = latest_location["lat"]
+    if lon is None:
+        lon = latest_location["lon"]
+
     susi_priv_bytes = base64.b64decode(SUSI_KEYS["priv_key_b64"])
     susi_priv = ec.derive_private_key(int.from_bytes(susi_priv_bytes, "big"), ec.SECP224R1())
 
-    # Tạo khóa tạm thời (Ephemeral Key) trên đường cong SECP224R1
     eph_priv = ec.generate_private_key(ec.SECP224R1())
     eph_pub_bytes = eph_priv.public_key().public_bytes(
         serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
-    )  # 57 bytes
+    )
 
-    # Tính shared secret qua ECDH
-    shared_secret = eph_priv.exchange(ec.ECDH(), susi_priv.public_key())  # 28 bytes
+    shared_secret = eph_priv.exchange(ec.ECDH(), susi_priv.public_key())
 
-    # KDF theo chuẩn ANSI X9.63: SHA256(shared_secret || counter(1) || eph_pub)
     kdf_input = shared_secret + struct.pack(">I", 1) + eph_pub_bytes
-    derived = hashlib.sha256(kdf_input).digest()  # 32 bytes
+    derived = hashlib.sha256(kdf_input).digest()
     aes_key = derived[:16]
     iv = derived[16:]
 
-    # Dữ liệu GPS chưa mã hóa (10 bytes: lat 4B, lon 4B, accuracy 1B, status 1B)
     lat_int = int(lat * 10000000)
     lon_int = int(lon * 10000000)
     accuracy = 10
-    status = 0  # Pin OK
+    status = 0
     plaintext = struct.pack(">IIBB", lat_int, lon_int, accuracy, status)
 
-    # Mã hóa AES-GCM
     aesgcm = AESGCM(aes_key)
-    enc_res = aesgcm.encrypt(iv, plaintext, None)  # 10 bytes ciphertext + 16 bytes tag
+    enc_res = aesgcm.encrypt(iv, plaintext, None)
 
-    # Timestamp Find My tính bằng số giây kể từ 2001-01-01 00:00:00 UTC
     t2001 = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
     now = datetime.datetime.now(datetime.timezone.utc)
     delta_sec = int((now - t2001).total_seconds())
     confidence = 95
 
-    # Cấu trúc payload: 4 bytes time + 1 byte confidence + 57 bytes eph_pub + 10 bytes enc + 16 bytes tag = 88 bytes
     payload = struct.pack(">IB", delta_sec, confidence) + eph_pub_bytes + enc_res
 
     return {
@@ -92,7 +145,10 @@ class CloudHaystackHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         print(f"[HTTP GET] {parsed.path}")
 
-        # Endpoint danh sách thiết bị cho app
+        # Thử lấy vị trí mới nhất từ Apple nếu có tài khoản
+        if apple_account:
+            query_real_apple_findmy()
+
         if parsed.path in ["/api/devices", "/devices"]:
             devices = [{
                 "id": 1,
@@ -114,7 +170,10 @@ class CloudHaystackHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        # Bản đồ Web trực tiếp xem trên Chrome điện thoại
+        cur_lat = latest_location["lat"]
+        cur_lon = latest_location["lon"]
+        source_text = latest_location["source"]
+
         html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -134,18 +193,18 @@ class CloudHaystackHandler(BaseHTTPRequestHandler):
 <body>
     <div id="header">
         <div id="title">🐾 SUSI Keychain AirTag</div>
-        <div id="status">● Đang Hoạt Động (Cloud 24/7)</div>
+        <div id="status">● Nguồn: {source_text}</div>
     </div>
     <div id="map"></div>
     <script>
-        var map = L.map('map').setView([{DEFAULT_LAT}, {DEFAULT_LON}], 16);
+        var map = L.map('map').setView([{cur_lat}, {cur_lon}], 16);
         L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
             maxZoom: 19,
             attribution: '© OpenStreetMap'
         }}).addTo(map);
 
-        var marker = L.marker([{DEFAULT_LAT}, {DEFAULT_LON}]).addTo(map)
-            .bindPopup("<b>🐾 SUSI Keychain AirTag</b><br>Trạng thái: Đang phát BLE Find My.<br>Tọa độ: {DEFAULT_LAT}, {DEFAULT_LON}<br>Cloud Server: Online 24/7.")
+        var marker = L.marker([{cur_lat}, {cur_lon}]).addTo(map)
+            .bindPopup("<b>🐾 SUSI Keychain AirTag</b><br>Tọa độ: {cur_lat}, {cur_lon}<br>Nguồn: {source_text}<br>Cloud Server: Online 24/7.")
             .openPopup();
     </script>
 </body>
@@ -171,14 +230,19 @@ class CloudHaystackHandler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"Error parsing POST body: {e}")
 
-        # Nếu app không gửi ID nào hoặc gửi rỗng, dùng khóa mặc định của SUSI
         if not req_ids:
             req_ids = [SUSI_KEYS["hashed_adv_key_b64"]]
 
+        # Ưu tiên lấy tọa độ thật từ Apple Find My nếu đã đăng nhập
+        real_report = query_real_apple_findmy()
+
         results = []
-        for rid in req_ids:
-            report = generate_encrypted_findmy_report(rid)
-            results.append(report)
+        if real_report:
+            results.append(real_report)
+        else:
+            for rid in req_ids:
+                report = generate_encrypted_findmy_report(rid)
+                results.append(report)
 
         response_dict = {"results": results}
         data = json.dumps(response_dict).encode("utf-8")
